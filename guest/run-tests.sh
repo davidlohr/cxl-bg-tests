@@ -794,7 +794,7 @@ g_fwcancel() {
 
 # ---------------------------------------------------------------------
 # Populate Log (0404h), CXL 4.0 8.2.10.5.5: "This may be a background
-# operation." QEMU with qemu/0004-*.patch runs it for four seconds on
+# operation." QEMU with qemu/0005-*.patch runs it for four seconds on
 # the Component State Dump Log and lets it be aborted, and the kernel
 # has a uapi command id for it. It is the first, and so far the only,
 # background command the suite sends as CXL_MEM_SEND_COMMAND by command
@@ -887,7 +887,7 @@ g_poplog() {
 	# Table 8-254: Opcode, then Command Effect, two bytes each
 	eff=$(field out <<<"$q" | fold -w8 | sed -n 's/^0404\(....\)$/\1/p')
 	if [ -z "$eff" ]; then
-		skip "Populate Log" "not in the CEL of $MEM (qemu/0004-*.patch?)"
+		skip "Populate Log" "not in the CEL of $MEM (qemu/0005-*.patch?)"
 		return
 	fi
 	eff=$(ledec "$eff")

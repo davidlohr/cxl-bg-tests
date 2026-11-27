@@ -30,7 +30,11 @@ QEMU needs the patches under `qemu/`:
   Table 8-254), where the kernel looks for it before it enables a
   background command by uapi id; QEMU had it at bit 7, and the bits
   after it off by one.
-- `0004-hw-cxl-Add-Populate-Log-and-Get-Log-Capabilities.patch`: adds
+- `0004-hw-cxl-Set-CEL-11-10-Valid-for-the-FM-DCD-commands.patch`: the
+  FM DCD commands report a configuration change after a Conventional
+  and a CXL Reset, which only counts with CEL[11:10] Valid set. No
+  suite reaches these commands.
+- `0005-hw-cxl-Add-Populate-Log-and-Get-Log-Capabilities.patch`: adds
   the Component State Dump Log, Get Log Capabilities (0402h) and
   Populate Log (0404h), a background command that can be aborted.
   Only `poplog` needs it, and skips without it.

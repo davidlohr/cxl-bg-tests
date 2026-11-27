@@ -1,0 +1,47 @@
+From 940f6bb4add79490940483720ebd3be7d976ce16 Mon Sep 17 00:00:00 2001
+From: Davidlohr Bueso <dave@stgolabs.net>
+Date: Fri, 27 Nov 2026 15:18:10 -0800
+Subject: [PATCH] hw/cxl: Set CEL[11:10] Valid for the FM DCD commands
+
+Set DC Region Configuration, Initiate Dynamic Capacity Add and Initiate
+Dynamic Capacity Release report a configuration change after a
+Conventional and after a CXL Reset, bits 10 and 11 of their command
+effects. Per CXL r4.0 Table 8-254 (CEL Entry Structure) those two bits
+are only valid when bit 9, CEL[11:10] Valid, is set as well.
+
+Signed-off-by: Davidlohr Bueso <dave@stgolabs.net>
+---
+ hw/cxl/cxl-mailbox-utils.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/hw/cxl/cxl-mailbox-utils.c b/hw/cxl/cxl-mailbox-utils.c
+index 1c36ecfe2c81..e516209f1805 100644
+--- a/hw/cxl/cxl-mailbox-utils.c
++++ b/hw/cxl/cxl-mailbox-utils.c
+@@ -4569,6 +4569,7 @@ static const struct cxl_cmd cxl_cmd_set_fm_dcd[256][256] = {
+     [FMAPI_DCD_MGMT][SET_DC_REGION_CONFIG] = { "SET_DC_REGION_CONFIG",
+         cmd_fm_set_dc_region_config, 16,
+         (CXL_MBOX_CONFIG_CHANGE_COLD_RESET |
++         CXL_MBOX_CEL_10_TO_11_VALID |
+          CXL_MBOX_CONFIG_CHANGE_CONV_RESET |
+          CXL_MBOX_CONFIG_CHANGE_CXL_RESET |
+          CXL_MBOX_IMMEDIATE_CONFIG_CHANGE |
+@@ -4578,6 +4579,7 @@ static const struct cxl_cmd cxl_cmd_set_fm_dcd[256][256] = {
+     [FMAPI_DCD_MGMT][INITIATE_DC_ADD] = { "INIT_DC_ADD",
+         cmd_fm_initiate_dc_add, ~0,
+         (CXL_MBOX_CONFIG_CHANGE_COLD_RESET |
++        CXL_MBOX_CEL_10_TO_11_VALID |
+         CXL_MBOX_CONFIG_CHANGE_CONV_RESET |
+         CXL_MBOX_CONFIG_CHANGE_CXL_RESET |
+         CXL_MBOX_IMMEDIATE_CONFIG_CHANGE |
+@@ -4585,6 +4587,7 @@ static const struct cxl_cmd cxl_cmd_set_fm_dcd[256][256] = {
+     [FMAPI_DCD_MGMT][INITIATE_DC_RELEASE] = { "INIT_DC_RELEASE",
+         cmd_fm_initiate_dc_release, ~0,
+         (CXL_MBOX_CONFIG_CHANGE_COLD_RESET |
++         CXL_MBOX_CEL_10_TO_11_VALID |
+          CXL_MBOX_CONFIG_CHANGE_CONV_RESET |
+          CXL_MBOX_CONFIG_CHANGE_CXL_RESET |
+          CXL_MBOX_IMMEDIATE_CONFIG_CHANGE |
+-- 
+2.39.5
+
