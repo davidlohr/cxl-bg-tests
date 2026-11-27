@@ -1,0 +1,79 @@
+From 170b7ace5fc16491a68970be4ac13fcc1e9cbb3d Mon Sep 17 00:00:00 2001
+From: Davidlohr Bueso <dave@stgolabs.net>
+Date: Fri, 27 Nov 2026 14:22:58 -0800
+Subject: [PATCH] hw/cxl: Fix CEL command effect bit positions
+
+The command effects from bit 7 onwards are off by one, and one of them
+is there twice. Per CXL r4.0 Table 8-254 (CEL Entry Structure), bit 7
+is Secondary Mailbox Supported, bit 8 Request Abort Background
+Operation Supported, bit 9 CEL[11:10] Valid, and bits 10 and 11 the
+configuration changes after a Conventional and after a CXL Reset.
+
+As a result every abortable background command advertised Secondary
+Mailbox Supported instead, so software could not find out that Request
+Abort Background Operation applies to it, and the FM DCD commands set
+the reserved bit 12.
+
+While at it, have those FM DCD commands set CEL[11:10] Valid, without
+which the two bits they report mean nothing.
+
+Fixes: 98cbac128f1c ("hw/cxl: Support aborting background commands")
+Fixes: 1befc7bde30d ("hw/cxl: mailbox-utils: 0x5602 - FMAPI Set DC Region Config")
+Signed-off-by: Davidlohr Bueso <dave@stgolabs.net>
+---
+ hw/cxl/cxl-mailbox-utils.c   |  3 +++
+ include/hw/cxl/cxl_mailbox.h | 11 +++++------
+ 2 files changed, 8 insertions(+), 6 deletions(-)
+
+diff --git a/hw/cxl/cxl-mailbox-utils.c b/hw/cxl/cxl-mailbox-utils.c
+index 1c36ecfe2c81..e516209f1805 100644
+--- a/hw/cxl/cxl-mailbox-utils.c
++++ b/hw/cxl/cxl-mailbox-utils.c
+@@ -4569,6 +4569,7 @@ static const struct cxl_cmd cxl_cmd_set_fm_dcd[256][256] = {
+     [FMAPI_DCD_MGMT][SET_DC_REGION_CONFIG] = { "SET_DC_REGION_CONFIG",
+         cmd_fm_set_dc_region_config, 16,
+         (CXL_MBOX_CONFIG_CHANGE_COLD_RESET |
++         CXL_MBOX_CEL_10_TO_11_VALID |
+          CXL_MBOX_CONFIG_CHANGE_CONV_RESET |
+          CXL_MBOX_CONFIG_CHANGE_CXL_RESET |
+          CXL_MBOX_IMMEDIATE_CONFIG_CHANGE |
+@@ -4578,6 +4579,7 @@ static const struct cxl_cmd cxl_cmd_set_fm_dcd[256][256] = {
+     [FMAPI_DCD_MGMT][INITIATE_DC_ADD] = { "INIT_DC_ADD",
+         cmd_fm_initiate_dc_add, ~0,
+         (CXL_MBOX_CONFIG_CHANGE_COLD_RESET |
++        CXL_MBOX_CEL_10_TO_11_VALID |
+         CXL_MBOX_CONFIG_CHANGE_CONV_RESET |
+         CXL_MBOX_CONFIG_CHANGE_CXL_RESET |
+         CXL_MBOX_IMMEDIATE_CONFIG_CHANGE |
+@@ -4585,6 +4587,7 @@ static const struct cxl_cmd cxl_cmd_set_fm_dcd[256][256] = {
+     [FMAPI_DCD_MGMT][INITIATE_DC_RELEASE] = { "INIT_DC_RELEASE",
+         cmd_fm_initiate_dc_release, ~0,
+         (CXL_MBOX_CONFIG_CHANGE_COLD_RESET |
++         CXL_MBOX_CEL_10_TO_11_VALID |
+          CXL_MBOX_CONFIG_CHANGE_CONV_RESET |
+          CXL_MBOX_CONFIG_CHANGE_CXL_RESET |
+          CXL_MBOX_IMMEDIATE_CONFIG_CHANGE |
+diff --git a/include/hw/cxl/cxl_mailbox.h b/include/hw/cxl/cxl_mailbox.h
+index a05d7cb5b7d1..752758219792 100644
+--- a/include/hw/cxl/cxl_mailbox.h
++++ b/include/hw/cxl/cxl_mailbox.h
+@@ -15,11 +15,10 @@
+ #define CXL_MBOX_IMMEDIATE_LOG_CHANGE (1 << 4)
+ #define CXL_MBOX_SECURITY_STATE_CHANGE (1 << 5)
+ #define CXL_MBOX_BACKGROUND_OPERATION (1 << 6)
+-#define CXL_MBOX_BACKGROUND_OPERATION_ABORT (1 << 7)
+-#define CXL_MBOX_SECONDARY_MBOX_SUPPORTED (1 << 8)
+-#define CXL_MBOX_REQUEST_ABORT_BACKGROUND_OP_SUPPORTED (1 << 9)
+-#define CXL_MBOX_CEL_10_TO_11_VALID (1 << 10)
+-#define CXL_MBOX_CONFIG_CHANGE_CONV_RESET (1 << 11)
+-#define CXL_MBOX_CONFIG_CHANGE_CXL_RESET (1 << 12)
++#define CXL_MBOX_SECONDARY_MBOX_SUPPORTED (1 << 7)
++#define CXL_MBOX_BACKGROUND_OPERATION_ABORT (1 << 8)
++#define CXL_MBOX_CEL_10_TO_11_VALID (1 << 9)
++#define CXL_MBOX_CONFIG_CHANGE_CONV_RESET (1 << 10)
++#define CXL_MBOX_CONFIG_CHANGE_CXL_RESET (1 << 11)
+ 
+ #endif
+-- 
+2.39.5
+

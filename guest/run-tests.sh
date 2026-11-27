@@ -5,15 +5,17 @@
 #   run-tests.sh [group...]     default: every group, in order
 #
 # Background commands as userspace are sent through the RAW interface:
-# QEMU implements no background-capable command that the kernel exposes
-# by uapi id. That needs CONFIG_CXL_MEM_RAW_COMMANDS and the debugfs
-# raw_allow_all override, and costs one WARN on first use.
+# QEMU implements one background-capable command that the kernel
+# exposes by uapi id, Populate Log, and only group poplog uses it. RAW
+# needs CONFIG_CXL_MEM_RAW_COMMANDS and the debugfs raw_allow_all
+# override, and costs one WARN on first use.
 #
 # Durations come from QEMU's models, on the 1G device of the topology:
 #   Sanitize                 8s
 #   Scan Media               ~8.2ms per MiB scanned, 1ms minimum
 #   Media Operations (zero)  4s, and it cannot be aborted
 #   Transfer FW              2s per part
+#   Populate Log             4s (Component State Dump Log)
 # Percentage Complete moves on a one second tick, and QEMU honours a
 # Request Abort only below 85%.
 #
@@ -791,6 +793,370 @@ g_fwcancel() {
 }
 
 # ---------------------------------------------------------------------
+# Populate Log (0404h), CXL 4.0 8.2.10.5.5: "This may be a background
+# operation." QEMU with qemu/0004-*.patch runs it for four seconds on
+# the Component State Dump Log and lets it be aborted, and the kernel
+# has a uapi command id for it. It is the first, and so far the only,
+# background command the suite sends as CXL_MEM_SEND_COMMAND by command
+# id rather than RAW: no CONFIG_CXL_MEM_RAW_COMMANDS, no raw_allow_all,
+# no taint, and the same asynchronous tracking as the RAW ones get.
+#
+# The kernel tells userspace that the operation started and nothing
+# more: how it ended is in the Background Command Status register,
+# which this reads behind the driver's back, and in the log itself.
+ID_GET_SUPPORTED_LOGS=3
+ID_GET_LOG=8
+ID_GET_TIMESTAMP=21
+ID_GET_LOG_CAPS=22
+ID_POPULATE_LOG=25
+UUID_CEL=0da9c0b5bf414b788f7996b1623b3f17
+UUID_CSDL=b3fab4cf01b64332943e5e9962f23567
+UUID_NONE=5ca1ab1e0000400080000000deadbeef	# not in Table 8-250
+
+poplog()  { $MBOX cmd "$MEM" $ID_POPULATE_LOG "$1"; }
+logcaps() { $MBOX cmd "$MEM" $ID_GET_LOG_CAPS "$1" --out 4; }
+# getlog <uuid> <offset> <length>
+getlog()  { $MBOX cmd "$MEM" $ID_GET_LOG "$1$(le32 "$2")$(le32 "$3")" --out "$3"; }
+# ledec <hex>: a little endian field of a payload, in decimal
+ledec()   { echo $(( 0x$(fold -w2 <<<"$1" | tac | tr -d '\n') )); }
+# wait_since <text> <count> <secs>: until the kernel log has it that often
+wait_since() {
+	local n=$(($3 * 10))
+	while [ $n -gt 0 ]; do
+		[ "$(since "$1")" -ge "$2" ] && return 0
+		sleep 0.1; n=$((n-1))
+	done
+	return 1
+}
+# wait_running <opcode> <secs>: until hardware runs that in the background
+wait_running() {
+	local n=$(($2 * 10))
+	while [ $n -gt 0 ]; do
+		snap
+		[ "$(sf sts_bg_op)$(sf bg_opcode)" = "1$1" ] && return 0
+		sleep 0.1; n=$((n-1))
+	done
+	return 1
+}
+# bg_ms <opcode>: from "started" to "ended" in the kernel log, since the mark
+bg_ms() {
+	dmesg_since | sed -n "s/^\[ *\([0-9.]*\)\].*operation ($1) \(started\|ended\).*/\1 \2/p" |
+		awk '$2 == "started" { s = $1 } $2 == "ended" { e = $1 }
+		     END { print (s && e) ? int((e - s) * 1000) : 99999 }'
+}
+
+# victim: have a Populate Log run that is young enough to be aborted.
+# QEMU runs it for four seconds, moves Percentage Complete once a
+# second and declines a Request Abort from 85% (0005h: the device "may
+# choose to continue its execution until completion"), so past the
+# first tick the one that runs is left to complete and another started.
+victim() {
+	local i r
+	for i in 1 2 3; do
+		snap
+		[ "$(sf sts_bg_op)$(sf bg_opcode)" = 10x404 ] &&
+			[ "$(sf bg_pct)" -le 25 ] && return 0
+		wait_idle 10
+		r=$(poplog $UUID_CSDL)
+		[ "$(er "$r")" = 00x1 ] || diag "victim: Populate Log: $r"
+	done
+	nok "a Populate Log to evict runs, below 25% ($L)"
+	return 1
+}
+
+g_poplog() {
+	local r q n caps size log dlen ts0 ts1 ts ms pat eff cel=0
+	local fw=/sys/class/firmware/$MEM blob=/tmp/cxl-bg-fw7.bin
+
+	# What the device has comes from its CEL, what the kernel makes of
+	# it from CXL_MEM_QUERY_COMMANDS, so that a kernel which fails to
+	# enable the command does not read as a device without it.
+	# Table 8-250: Log Size is "the maximum number of bytes of log
+	# data available to retrieve"
+	r=$($MBOX cmd "$MEM" $ID_GET_SUPPORTED_LOGS "" --out 0x100)
+	size=$(field out <<<"$r" | sed -n "s/.*$UUID_CEL\(.\{8\}\).*/\1/p")
+	if [ -z "$size" ]; then
+		nok "Get Supported Logs has the CEL ($r)"
+		return
+	fi
+	q=$(getlog $UUID_CEL 0 $(ledec "$size"))
+	if [ "$(er "$q")" != 00x0 ]; then
+		nok "Get Log reads the CEL ($(er "$q"))"
+		return
+	fi
+	# Table 8-254: Opcode, then Command Effect, two bytes each
+	eff=$(field out <<<"$q" | fold -w8 | sed -n 's/^0404\(....\)$/\1/p')
+	if [ -z "$eff" ]; then
+		skip "Populate Log" "not in the CEL of $MEM (qemu/0004-*.patch?)"
+		return
+	fi
+	eff=$(ledec "$eff")
+	if ! q=$($MBOX query "$MEM" 2>&1); then
+		nok "CXL_MEM_QUERY_COMMANDS ($(tail -1 <<<"$q"))"
+		return
+	fi
+	n=$(field "cmd$ID_POPULATE_LOG" <<<"$q")
+	if [ -z "$n" ]; then
+		nok "the kernel has a uapi command for Populate Log, which the CEL of $MEM has"
+		return
+	fi
+	# "Bit[6]: Background Operation", "Bit[8]: Request Abort Background
+	# Operation Supported"; cxl_walk_cel(): "only enable uapi bgcmds
+	# that may be canceled"
+	q=$(printf 'effects 0x%04x, flags %s' $eff $n)
+	case $(( (eff >> 6) & 1 ))$(( (eff >> 8) & 1 )) in
+	11)
+		if [ $((n & 1)) = 0 ]; then
+			nok "the kernel enables Populate Log by uapi id: the CEL has it as a background command that can be aborted ($q)"
+			return
+		fi
+		ok "the kernel enables Populate Log by uapi id: the CEL has it as a background command that can be aborted ($q)"
+		;;
+	10)
+		check "the kernel leaves a Populate Log that cannot be aborted disabled ($q)" \
+			test $((n & 1)) = 0
+		skip "Populate Log" "in the background, and not abortable on $MEM"
+		return
+		;;
+	*)
+		skip "Populate Log" "not a background command on $MEM ($q)"
+		return
+		;;
+	esac
+
+	size=$(field out <<<"$r" | sed -n "s/.*$UUID_CSDL\(.\{8\}\).*/\1/p")
+	if [ -z "$size" ]; then
+		skip "Populate Log" "no Component State Dump Log ($r)"
+		return
+	fi
+	size=$(ledec "$size")
+	ok "Get Supported Logs has the Component State Dump Log ($size bytes)"
+
+	# Table 8-269, Bit[1]: Populate Log Supported
+	r=$(logcaps $UUID_CSDL)
+	caps=$(field out <<<"$r")
+	if [ "$(er "$r")" != 00x0 ] || [ $(( 0x${caps:0:2} & 2 )) = 0 ]; then
+		skip "Populate Log" "Populate Log Supported not set for that log ($r)"
+		return
+	fi
+	ok "Get Log Capabilities: Populate Log Supported for it ($caps)"
+	# 8.2.10.5.3: "shall return Invalid Log if the specified Log
+	# Identifier is not supported by the component"
+	r=$(logcaps $UUID_NONE)
+	check "Get Log Capabilities: Invalid Log for a log the device lacks ($r)" \
+		test "$(er "$r")" = 00x17
+	r=$(logcaps $UUID_CEL)
+	[ "$(er "$r")" = 00x0 ] && [ $(( 0x$(field out <<<"$r" | cut -c1-2) & 2 )) = 0 ] && cel=1
+
+	# --- one Populate Log, left alone
+	settle
+	mark
+	ts0=$(ledec "$($MBOX cmd "$MEM" $ID_GET_TIMESTAMP "" --out 8 | field out)")
+	r=$(poplog $UUID_CSDL)
+	check "Populate Log by uapi id: errno 0, retval Background Command Started ($r)" \
+		test "$(er "$r")" = 00x1
+	check "... without waiting for it" test "$(field ms <<<"$r")" -lt 500
+	snap
+	check "hardware runs opcode 0404h in the background ($L)" \
+		test "$(sf sts_bg_op)$(sf bg_opcode)" = 10x404
+	r=$(ident)
+	check "other commands still served (errno=$(field errno <<<"$r"))" \
+		test "$(field errno <<<"$r")" = 0
+	# 8.2.10.5.2.3, Get Log with Offset = 0: "Return Retry Required
+	# if the log contents are not fully populated"
+	r=$(getlog $UUID_CSDL 0 $size)
+	check "Get Log while it populates: Retry Required ($(er "$r"))" \
+		test "$(er "$r")" = 00x5
+	check "hardware completes it" wait_idle 10
+	snap
+	check "completed with Success, at 100% ($L)" \
+		test "$(sf sts_bg_op)$(sf bg_opcode)$(sf bg_pct)$(sf bg_rc)" = 00x4041000x0
+	# The driver only prints "ended" for an operation it tracked. The
+	# poller looks at one second and at twelve; hardware takes four.
+	if [ "$(sf ctrl_bg_irq)" = 1 ]; then
+		wait_since '(0x0404) ended' 1 3
+		ms=$(bg_ms 0x0404)
+		check "the driver tracked it: completion delivered by interrupt (${ms}ms)" \
+			test "$ms" -lt 11500
+	else
+		wait_since '(0x0404) ended' 1 14
+		ms=$(bg_ms 0x0404)
+		check "the driver tracked it: completion found by the poller, at twelve seconds (${ms}ms)" \
+			test "$ms" -ge 11500 -a "$ms" -lt 13500
+	fi
+	check "started and ended once, nothing aborted" \
+		test "$(since '(0x0404) started')/$(since '(0x0404) ended')/$(since 'background operation aborted')/$(since 'Sending command: 0x0005')" = 1/1/0/0
+	ts1=$(ledec "$($MBOX cmd "$MEM" $ID_GET_TIMESTAMP "" --out 8 | field out)")
+	r=$(ident)
+	check "Identify served afterwards (errno=$(field errno <<<"$r"))" \
+		test "$(field errno <<<"$r")" = 0
+
+	# Table 8-256: Data Length at 00h, Timestamp at 08h "at the time
+	# the Component State Dump Data was generated", Flags at 20h with
+	# Bit[0] Auto Populate Data "cleared to 0 if [...] generated
+	# using Populate Log", data from 40h and vendor specific: QEMU
+	# counts bytes.
+	r=$(getlog $UUID_CSDL 0 $size)
+	log=$(field out <<<"$r")
+	check "Get Log reads the log back ($(er "$r"), $((${#log} / 2)) bytes)" \
+		test "$(er "$r")" = 00x0 -a ${#log} = $((size * 2))
+	dlen=$(ledec "${log:0:8}")
+	check "... Component State Dump Data Length $dlen, Auto Populate Data clear" \
+		test "$dlen" -gt 0 -a "$dlen" -le $((size - 64)) -a $(( 0x${log:64:2} & 1 )) = 0
+	ts=$(ledec "${log:16:16}")
+	check "... Timestamp from while it ran ($ts0 <= $ts <= $ts1)" \
+		test "$ts0" -le "$ts" -a "$ts" -le "$ts1"
+	pat=$(printf '%02x' $(seq 0 255))
+	check "... the data is the pattern QEMU writes" \
+		test "${log:128:$((dlen * 2))}" = "${pat:0:$((dlen * 2))}"
+	# "Return Success and provide the log contents of the specified
+	# offset" once a Get Log with Offset = 0 has succeeded
+	r=$(getlog $UUID_CSDL 0x40 16)
+	check "... and a fetch sequence carries on from there ($r)" \
+		test "$(er "$r")$(field out <<<"$r")" = "00x0${pat:0:32}"
+
+	# --- Populate Log the device turns down: the return code is all
+	# userspace gets, and the driver must not track what never began
+	mark
+	# 8.2.10.5.5: "shall return Invalid Log if the specified Log
+	# Identifier is not supported by the component"
+	r=$(poplog $UUID_NONE)
+	check "Populate Log for a log the device lacks: retval Invalid Log ($r)" \
+		test "$(er "$r")" = 00x17
+	# "shall return Invalid Input if the specified Log Identifier
+	# does not have the Populate Log Supported bit set to 1"
+	if [ $cel = 1 ]; then
+		r=$(poplog $UUID_CEL)
+		check "Populate Log for the CEL, which has no Populate Log Supported: retval Invalid Input ($r)" \
+			test "$(er "$r")" = 00x2
+	else
+		skip "Populate Log for the CEL" "the CEL claims Populate Log Supported"
+	fi
+	check "the device saw them, nothing started" \
+		test "$(since 'Sending command: 0x0404')/$(reg sts_bg_op)/$(since '(0x0404) started')" = $((1 + cel))/0/0
+	r=$(poplog $UUID_CSDL)
+	check "the next Populate Log starts ($r)" test "$(er "$r")" = 00x1
+	check "... with nothing left behind for it to end or abort" \
+		test "$(since '(0x0404) started')/$(since '(0x0404) ended')/$(since 'Sending command: 0x0005')" = 1/0/0
+	# 8.2.10.5.2.3, nonzero Offset: "Return Interrupted if the
+	# contents of the Component State Dump Log have changed since
+	# the last time the component returned Success for a Get Log
+	# command with Offset = 0"; they are cleared before populating
+	r=$(getlog $UUID_CSDL 0x40 16)
+	check "the fetch sequence of before is told so: Interrupted ($(er "$r"))" \
+		test "$(er "$r")" = 00x18
+
+	# --- cxl_try_to_cancel_background(): "incoming user bgcmd ->
+	# abort on-going user bgcmd". From here on Populate Log is told
+	# apart from any other command by what cxl_is_background_cmd()
+	# makes of it: what came before only took the uapi command and
+	# the tracking of a userspace background command.
+	victim || return
+	mark
+	r=$(poplog $UUID_CSDL)
+	check "a second Populate Log evicts the one that runs ($r)" \
+		test "$(er "$r")" = 00x1
+	check "... by aborting it: Request Abort, ended, started anew" \
+		test "$(since 'Sending command: 0x0005')/$(since 'background operation aborted')/$(since '(0x0404) ended')/$(since '(0x0404) started')" = 1/1/1/1
+	check "hardware runs the second one" \
+		test "$(reg sts_bg_op)$(reg bg_opcode)" = 10x404
+	if [ "$HAVE_RAW" = 1 ]; then
+		victim || return
+		r=$(scan $SCAN_LONG)
+		check "a RAW Scan Media evicts a Populate Log ($r)" \
+			test "$(er "$r")$(reg sts_bg_op)$(reg bg_opcode)" = 00x110x4304
+		r=$(poplog $UUID_CSDL)
+		check "a Populate Log evicts a RAW Scan Media ($r)" \
+			test "$(er "$r")$(reg sts_bg_op)$(reg bg_opcode)" = 00x110x404
+	fi
+
+	# The eviction comes before the device has seen the command that
+	# evicts: one it refuses leaves the abort in the register for
+	# once. 8.2.10.1.5: "the Percentage Complete field [...] shall
+	# indicate a value smaller than 100, and the Background Operation
+	# bit shall be cleared"; Table 8-208 has Aborted (0012h) for the
+	# code, reported in the Return Code field of Table 8-210.
+	# That a refused command has already cost the running one its
+	# life is how the kernel orders things today, not something the
+	# spec asks for: this goes with cxl_pci_mbox_send().
+	if [ $cel = 1 ]; then
+		victim || return
+		mark
+		r=$(poplog $UUID_CEL)
+		check "an evicting Populate Log the device refuses: Invalid Input ($r)" \
+			test "$(er "$r")" = 00x2
+		snap
+		check "nothing runs: the evicted one reads Aborted, below 100% ($L)" \
+			test "$(sf sts_bg_op)$(sf bg_opcode)$(sf bg_rc)" = 00x4040x12 -a "$(sf bg_pct)" -lt 100
+		check "the driver tracks nothing either" \
+			test "$(since 'background operation aborted')/$(since '(0x0404) ended')/$(since '(0x0404) started')" = 1/1/0
+		r=$(poplog $UUID_CSDL)
+		check "Populate Log accepted again ($r)" test "$(er "$r")" = 00x1
+	fi
+
+	# --- "incoming kernel bgcmd -> abort on-going user bgcmd", and
+	# not the other way around: a Transfer FW the kernel waits for
+	if [ -d "$fw" ]; then
+		dd if=/dev/urandom of=$blob bs=128 count=30 status=none
+		victim || return
+		mark
+		fw_upload $blob
+		check "a firmware upload evicts a Populate Log: hardware runs Transfer FW" \
+			wait_running 0x201 3
+		check "... the kernel aborted it" \
+			test "$(since 'Sending command: 0x0005')/$(since 'background operation aborted')/$(since '(0x0404) ended')" = 1/1/1
+		r=$(poplog $UUID_CSDL)
+		check "Populate Log refused while the kernel polls for Transfer FW ($r)" \
+			test "$(field errno <<<"$r")" = EBUSY
+		check "... it was never sent" test "$(since 'Sending command: 0x0404')" = 0
+		fw_idle 20
+		check "the upload completes (status=$(cat $fw/status) error='$(cat $fw/error 2>/dev/null)')" \
+			test "$(cat $fw/status)" = idle -a -z "$(cat $fw/error 2>/dev/null)"
+		rm -f $blob
+	fi
+	# ... and a sanitize the kernel does not wait for
+	if [ -e "$MEMDIR/security/sanitize" ]; then
+		settle
+		victim || return
+		mark
+		if echo 1 > "$MEMDIR/security/sanitize"; then
+			ok "the kernel's sanitize evicts a Populate Log"
+		else
+			nok "the kernel's sanitize evicts a Populate Log"
+		fi
+		check "... by aborting it, hardware runs the sanitize" \
+			test "$(since 'background operation aborted')/$(reg sts_bg_op)$(reg bg_opcode)" = 1/10x4400
+		r=$(poplog $UUID_CSDL)
+		check "Populate Log cannot evict a sanitize ($r)" \
+			test "$(field errno <<<"$r")" = EBUSY
+		check "... it was never sent" test "$(since 'Sending command: 0x0404')" = 0
+		check "sanitize completes" wait_state_change 20
+	fi
+
+	# --- and after all of that
+	settle
+	mark
+	r=$(poplog $UUID_CSDL)
+	check "Populate Log starts again ($r)" test "$(er "$r")" = 00x1
+	check "... and completes" wait_idle 10
+	snap
+	check "... with Success, at 100% ($L)" \
+		test "$(sf sts_bg_op)$(sf bg_opcode)$(sf bg_pct)$(sf bg_rc)" = 00x4041000x0
+	# leave with the driver idle too: without the interrupt that
+	# takes until the poller's second look
+	if [ "$(sf ctrl_bg_irq)" = 1 ]; then
+		wait_since '(0x0404) ended' 1 3
+	else
+		wait_since '(0x0404) ended' 1 14
+	fi
+	check "... and the driver is done with it: started and ended once, nothing aborted" \
+		test "$(since '(0x0404) started')/$(since '(0x0404) ended')/$(since 'background operation aborted')" = 1/1/0
+	r=$(getlog $UUID_CSDL 0 $size)
+	check "... the log is populated ($(er "$r"), Data Length $(ledec "$(field out <<<"$r" | cut -c1-8)"))" \
+		test "$(er "$r")" = 00x0 -a "$(ledec "$(field out <<<"$r" | cut -c1-8)")" -gt 0
+}
+
+# ---------------------------------------------------------------------
 # No interrupt at all (pci=nomsi): completion is something the driver
 # has to go and look for. The poller looks one second after the command
 # and then eleven seconds later.
@@ -1079,7 +1445,7 @@ g_quadsanitize() { multi sanitize; }
 g_quadunbind()   { multi unbind; }
 g_quadroles()    { multi roles; }
 
-GROUPS_ALL="irq fw fwcancel sanitize user abort rawabort abortdeclined evictfail devbusy poison backtoback cancelrace unbind stress"
+GROUPS_ALL="irq fw fwcancel sanitize user abort rawabort abortdeclined evictfail devbusy poison poplog backtoback cancelrace unbind stress"
 setup
 g_preflight
 for g in ${*:-$GROUPS_ALL}; do

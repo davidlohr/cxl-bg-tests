@@ -1,0 +1,323 @@
+From 083e6711e586635f667b0f0d10f29b3769b9e6d9 Mon Sep 17 00:00:00 2001
+From: Davidlohr Bueso <dave@stgolabs.net>
+Date: Fri, 27 Nov 2026 14:22:58 -0800
+Subject: [PATCH] hw/cxl: Add Populate Log and Get Log Capabilities
+
+Add the Component State Dump Log to cxl-type3, along with the two
+commands needed to make use of it: Get Log Capabilities (0402h) and
+Populate Log (0404h). The log has no Auto Populate trigger, cannot be
+cleared and does not persist: it reads as empty until populated.
+
+Populate Log runs in the background for four seconds and may be
+aborted, which leaves the log empty. While it runs a Get Log at
+offset 0 returns Retry Required, and a fetch sequence that was under
+way is told the log changed with Interrupted. Populate Log returns
+Invalid Input for the CEL, and Invalid Log for anything else.
+
+Signed-off-by: Davidlohr Bueso <dave@stgolabs.net>
+---
+ hw/cxl/cxl-mailbox-utils.c  | 194 ++++++++++++++++++++++++++++++++++--
+ include/hw/cxl/cxl_device.h |  23 +++++
+ 2 files changed, 211 insertions(+), 6 deletions(-)
+
+diff --git a/hw/cxl/cxl-mailbox-utils.c b/hw/cxl/cxl-mailbox-utils.c
+index e516209f1805..34385121d1d5 100644
+--- a/hw/cxl/cxl-mailbox-utils.c
++++ b/hw/cxl/cxl-mailbox-utils.c
+@@ -84,6 +84,8 @@ enum {
+     LOGS        = 0x04,
+         #define GET_SUPPORTED 0x0
+         #define GET_LOG       0x1
++        #define GET_LOG_CAPABILITIES 0x2
++        #define POPULATE_LOG  0x4
+     FEATURES    = 0x05,
+         #define GET_SUPPORTED 0x0
+         #define GET_FEATURE   0x1
+@@ -1177,6 +1179,53 @@ static const QemuUUID cel_uuid = {
+                  0x96, 0xb1, 0x62, 0x3b, 0x3f, 0x17)
+ };
+ 
++/* CXL r4.0 Section 8.2.10.5.2.3: Component State Dump Log */
++static const QemuUUID csdl_uuid = {
++    .data = UUID(0xb3fab4cf, 0x01b6, 0x4332, 0x94, 0x3e,
++                 0x5e, 0x99, 0x62, 0xf2, 0x35, 0x67)
++};
++
++/* Long enough to be seen running, and to be aborted at any point */
++#define CXL_CSDL_POPULATE_MS 4000UL
++
++/* CXL r4.0 Section 8.2.10.5.3: Table 8-269: Parameter Flags */
++#define CXL_LOG_CAP_CLEAR BIT(0)
++#define CXL_LOG_CAP_POPULATE BIT(1)
++#define CXL_LOG_CAP_AUTO_POPULATE BIT(2)
++#define CXL_LOG_CAP_PERSISTENT_COLD_RESET BIT(3)
++
++/*
++ * The Component State Dump Log shall support at least one population method,
++ * and the only one here is Populate Log.
++ */
++static bool cxl_cci_has_csdl(CXLCCI *cci)
++{
++    return cci->cxl_cmd_set[LOGS][POPULATE_LOG].handler != NULL;
++}
++
++static bool cxl_csdl_populating(CXLCCI *cci)
++{
++    return cci->bg.runtime > 0 &&
++           cci->bg.opcode == ((LOGS << 8) | POPULATE_LOG);
++}
++
++/* Returns false if the log is not supported by the CCI */
++static bool cxl_log_capabilities(CXLCCI *cci, const QemuUUID *uuid,
++                                 uint32_t *flags)
++{
++    if (qemu_uuid_is_equal(uuid, &cel_uuid)) {
++        *flags = 0;
++        return true;
++    }
++
++    if (cxl_cci_has_csdl(cci) && qemu_uuid_is_equal(uuid, &csdl_uuid)) {
++        *flags = CXL_LOG_CAP_POPULATE;
++        return true;
++    }
++
++    return false;
++}
++
+ /* CXL r3.1 Section 8.2.9.5.1: Get Supported Logs (Opcode 0400h) */
+ static CXLRetCode cmd_logs_get_supported(const struct cxl_cmd *cmd,
+                                          uint8_t *payload_in,
+@@ -1191,15 +1240,64 @@ static CXLRetCode cmd_logs_get_supported(const struct cxl_cmd *cmd,
+         struct {
+             QemuUUID uuid;
+             uint32_t size;
+-        } log_entries[1];
++        } QEMU_PACKED log_entries[];
+     } QEMU_PACKED *supported_logs = (void *)payload_out;
+-    QEMU_BUILD_BUG_ON(sizeof(*supported_logs) != 0x1c);
++    int n = 0;
++
++    QEMU_BUILD_BUG_ON(sizeof(*supported_logs) != 0x8);
++    QEMU_BUILD_BUG_ON(sizeof(supported_logs->log_entries[0]) != 0x14);
++
++    supported_logs->log_entries[n].uuid = cel_uuid;
++    supported_logs->log_entries[n].size = 4 * cci->cel_size;
++    n++;
++
++    if (cxl_cci_has_csdl(cci)) {
++        supported_logs->log_entries[n].uuid = csdl_uuid;
++        supported_logs->log_entries[n].size = sizeof(cci->csdl.log);
++        n++;
++    }
++
++    supported_logs->entries = n;
++
++    *len_out = sizeof(*supported_logs) +
++               n * sizeof(supported_logs->log_entries[0]);
++    return CXL_MBOX_SUCCESS;
++}
++
++/*
++ * CXL r4.0 Section 8.2.10.5.2.3: Component State Dump Log
++ *
++ * The log only changes through Populate Log, which leaves it empty until
++ * the background operation completes. A fetch sequence therefore always
++ * reads the log as it was at offset 0, or is told that it changed.
++ */
++static CXLRetCode cxl_get_csdl(CXLCCI *cci, uint32_t offset, uint32_t length,
++                               uint8_t *payload_out, size_t *len_out)
++{
++    QEMU_BUILD_BUG_ON(offsetof(CXLCompStateDumpLog, data) != 0x40);
++
++    if ((uint64_t)offset + length > sizeof(cci->csdl.log)) {
++        return CXL_MBOX_INVALID_INPUT;
++    }
++
++    if (offset == 0) {
++        if (cxl_csdl_populating(cci)) {
++            return CXL_MBOX_RETRY_REQUIRED;
++        }
++        cci->csdl.fetching = true;
++        cci->csdl.changed = false;
++    } else {
++        if (!cci->csdl.fetching) {
++            return CXL_MBOX_INVALID_INPUT;
++        }
++        if (cci->csdl.changed) {
++            return CXL_MBOX_INTERRUPTED;
++        }
++    }
+ 
+-    supported_logs->entries = 1;
+-    supported_logs->log_entries[0].uuid = cel_uuid;
+-    supported_logs->log_entries[0].size = 4 * cci->cel_size;
++    *len_out = length;
++    memcpy(payload_out, (uint8_t *)&cci->csdl.log + offset, length);
+ 
+-    *len_out = sizeof(*supported_logs);
+     return CXL_MBOX_SUCCESS;
+ }
+ 
+@@ -1223,6 +1321,12 @@ static CXLRetCode cmd_logs_get_log(const struct cxl_cmd *cmd,
+         return CXL_MBOX_INVALID_INPUT;
+     }
+ 
++    if (cxl_cci_has_csdl(cci) &&
++        qemu_uuid_is_equal(&get_log->uuid, &csdl_uuid)) {
++        return cxl_get_csdl(cci, get_log->offset, get_log->length,
++                            payload_out, len_out);
++    }
++
+     if (!qemu_uuid_is_equal(&get_log->uuid, &cel_uuid)) {
+         return CXL_MBOX_INVALID_LOG;
+     }
+@@ -1249,6 +1353,74 @@ static CXLRetCode cmd_logs_get_log(const struct cxl_cmd *cmd,
+     return CXL_MBOX_SUCCESS;
+ }
+ 
++/* CXL r4.0 Section 8.2.10.5.3: Get Log Capabilities (Opcode 0402h) */
++static CXLRetCode cmd_logs_get_log_capabilities(const struct cxl_cmd *cmd,
++                                                uint8_t *payload_in,
++                                                size_t len_in,
++                                                uint8_t *payload_out,
++                                                size_t *len_out,
++                                                CXLCCI *cci)
++{
++    QemuUUID *uuid = (void *)payload_in;
++    uint32_t flags;
++
++    if (!cxl_log_capabilities(cci, uuid, &flags)) {
++        return CXL_MBOX_INVALID_LOG;
++    }
++
++    stl_le_p(payload_out, flags);
++    *len_out = sizeof(flags);
++
++    return CXL_MBOX_SUCCESS;
++}
++
++/* The log was cleared when the command was accepted */
++static void __do_populate_log(CXLCCI *cci)
++{
++    CXLDeviceState *cxl_dstate = &CXL_TYPE3(cci->d)->cxl_dstate;
++    CXLCompStateDumpLog *log = &cci->csdl.log;
++    int i;
++
++    stl_le_p(&log->data_len, sizeof(log->data));
++    stq_le_p(&log->timestamp, cxl_device_get_timestamp(cxl_dstate));
++    /* The data is vendor specific and its format is not indicated */
++    for (i = 0; i < sizeof(log->data); i++) {
++        log->data[i] = i;
++    }
++}
++
++/* CXL r4.0 Section 8.2.10.5.5: Populate Log (Opcode 0404h) */
++static CXLRetCode cmd_logs_populate_log(const struct cxl_cmd *cmd,
++                                        uint8_t *payload_in,
++                                        size_t len_in,
++                                        uint8_t *payload_out,
++                                        size_t *len_out,
++                                        CXLCCI *cci)
++{
++    QemuUUID *uuid = (void *)payload_in;
++    uint32_t flags;
++
++    if (!cxl_log_capabilities(cci, uuid, &flags)) {
++        return CXL_MBOX_INVALID_LOG;
++    }
++
++    if (!(flags & CXL_LOG_CAP_POPULATE)) {
++        return CXL_MBOX_INVALID_INPUT;
++    }
++
++    /*
++     * Only the Component State Dump Log gets here: any existing data is
++     * cleared before populating the new log contents.
++     */
++    memset(&cci->csdl.log, 0, sizeof(cci->csdl.log));
++    cci->csdl.changed = true;
++
++    cci->bg.runtime = CXL_CSDL_POPULATE_MS;
++    *len_out = 0;
++
++    return CXL_MBOX_BG_STARTED;
++}
++
+ /* CXL r3.1 section 8.2.9.6: Features */
+ /*
+  * Get Supported Features output payload
+@@ -4466,6 +4638,12 @@ static const struct cxl_cmd cxl_cmd_set[256][256] = {
+     [LOGS][GET_SUPPORTED] = { "LOGS_GET_SUPPORTED", cmd_logs_get_supported,
+                               0, 0 },
+     [LOGS][GET_LOG] = { "LOGS_GET_LOG", cmd_logs_get_log, 0x18, 0 },
++    [LOGS][GET_LOG_CAPABILITIES] = { "LOGS_GET_LOG_CAPABILITIES",
++                                     cmd_logs_get_log_capabilities, 0x10, 0 },
++    [LOGS][POPULATE_LOG] = { "LOGS_POPULATE_LOG", cmd_logs_populate_log, 0x10,
++                             (CXL_MBOX_IMMEDIATE_LOG_CHANGE |
++                              CXL_MBOX_BACKGROUND_OPERATION |
++                              CXL_MBOX_BACKGROUND_OPERATION_ABORT)},
+     [FEATURES][GET_SUPPORTED] = { "FEATURES_GET_SUPPORTED",
+                                   cmd_features_get_supported, 0x8, 0 },
+     [FEATURES][GET_FEATURE] = { "FEATURES_GET_FEATURE",
+@@ -4699,6 +4877,9 @@ static void bg_timercb(void *opaque)
+         case 0x0202: /* fw activate */
+             __do_firmware_activate(cci);
+             break;
++        case 0x0404: /* populate log */
++            __do_populate_log(cci);
++            break;
+         case 0x4400: /* sanitize */
+         {
+             CXLType3Dev *ct3d = CXL_TYPE3(cci->d);
+@@ -4795,6 +4976,7 @@ void cxl_init_cci(CXLCCI *cci, size_t payload_max)
+                                  bg_timercb, cci);
+     qemu_mutex_init(&cci->bg.lock);
+ 
++    memset(&cci->csdl, 0, sizeof(cci->csdl));
+     memset(&cci->fw, 0, sizeof(cci->fw));
+     cci->fw.active_slot = 1;
+     cci->fw.slot[cci->fw.active_slot - 1] = true;
+diff --git a/include/hw/cxl/cxl_device.h b/include/hw/cxl/cxl_device.h
+index 42e618a9fb57..aec26ad596ca 100644
+--- a/include/hw/cxl/cxl_device.h
++++ b/include/hw/cxl/cxl_device.h
+@@ -172,6 +172,20 @@ typedef struct CXLEventLog {
+     QSIMPLEQ_HEAD(, CXLEvent) events;
+ } CXLEventLog;
+ 
++/* CXL r4.0 Table 8-256: Component State Dump Log Format */
++#define CXL_CSDL_DATA_SIZE 0x100
++typedef struct CXLCompStateDumpLog {
++    uint32_t data_len;
++    uint8_t auto_populate_trigger_count;
++    uint8_t event_log;
++    uint16_t event_record_handle;
++    uint64_t timestamp;
++    QemuUUID format_uuid;
++    uint32_t flags;
++    uint8_t rsvd[0x1c];
++    uint8_t data[CXL_CSDL_DATA_SIZE];
++} QEMU_PACKED CXLCompStateDumpLog;
++
+ typedef struct CXLCCI {
+     struct cxl_cmd cxl_cmd_set[256][256];
+     struct cel_log {
+@@ -210,6 +224,15 @@ typedef struct CXLCCI {
+         uint8_t bg_slot;
+     } fw;
+ 
++    /* Component State Dump Log */
++    struct {
++        CXLCompStateDumpLog log;
++        /* a Get Log at offset 0 succeeded, a fetch sequence can go on */
++        bool fetching;
++        /* the log changed since then */
++        bool changed;
++    } csdl;
++
+     size_t payload_max;
+     /* Pointer to device hosting the CCI */
+     DeviceState *d;
+-- 
+2.39.5
+

@@ -14,7 +14,7 @@ mkdir -p "$OUT"
 declare -A TOPO=( [t1]=t1-single.sh [t2]=t2-pair.sh [t3]=t3-noirq.sh
 		  [t4]=t4-quad.sh [t5]=t5-actfw.sh )
 # test groups each suite runs by default (empty: all single-device ones)
-declare -A SGROUPS=( [t1]="" [t2]="pair" [t3]="noirq fw"
+declare -A SGROUPS=( [t1]="" [t2]="pair" [t3]="noirq fw poplog"
 		     [t4]="quadfw quadmatrix quadbarrage quadsanitize quadunbind quadroles"
 		     [t5]="actfw" )
 ORDER="t1 t2 t3 t4 t5"

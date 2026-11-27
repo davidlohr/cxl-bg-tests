@@ -4,6 +4,7 @@
 #   cxlmbox.py regs  <memN>             mailbox registers, decoded
 #   cxlmbox.py raw   <memN> <opcode> [hex-payload] [--out N]
 #   cxlmbox.py cmd   <memN> <id>     [hex-payload] [--out N]
+#   cxlmbox.py query <memN>             uapi commands and their flags
 #   cxlmbox.py hammer <memN> <secs> <scan-threads> <plain-threads>
 #
 # "raw" and "cmd" go through CXL_MEM_SEND_COMMAND, the former as a RAW
@@ -12,6 +13,9 @@
 # Both print one line:
 #
 #   errno=<name|0> retval=0x<hw return code> ms=<elapsed> out=<hex>
+#
+# "query" is CXL_MEM_QUERY_COMMANDS: one "cmd<id>=0x<flags>" per command
+# the kernel knows, bit 0 set if it is enabled for this device.
 #
 # "regs" reads the registers behind the driver's back, through the PCI
 # resource file, to see what hardware believes rather than what the
@@ -25,6 +29,7 @@ import struct
 import sys
 import time
 
+CXL_MEM_QUERY_COMMANDS = (2 << 30) | (8 << 16) | (0xCE << 8) | 1
 CXL_MEM_SEND_COMMAND = (3 << 30) | (48 << 16) | (0xCE << 8) | 2
 CMD_ID_RAW = 2
 
@@ -118,6 +123,20 @@ def send(memdev, cmd_id, opcode, payload, out_size):
         errno.errorcode.get(err, err) if err else 0, retval, ms,
         outbuf.raw[:osz].hex() if not err else ""))
     return 1 if err else 0
+
+
+def query(memdev):
+    fd = os.open("/dev/cxl/" + memdev, os.O_RDWR)
+    hdr = bytearray(8)
+    fcntl.ioctl(fd, CXL_MEM_QUERY_COMMANDS, hdr)     # n_commands 0: how many
+    n, = struct.unpack_from("<I", hdr)
+    buf = bytearray(struct.pack("<II", n, 0)) + bytearray(16 * n)
+    fcntl.ioctl(fd, CXL_MEM_QUERY_COMMANDS, buf)
+    os.close(fd)
+    # slots of deprecated ids, and of RAW when not configured, read id 0
+    cmds = [struct.unpack_from("<II", buf, 8 + 16 * i) for i in range(n)]
+    print(" ".join("cmd%d=0x%x" % c for c in cmds if c[0]))
+    return 0
 
 
 def hammer(memdev, secs, nscan, nplain):
@@ -227,6 +246,8 @@ def main(argv):
         print(" ".join("%s=%s" % (k, ("0x%x" % v) if k.endswith(("rc", "opcode")) else v)
                        for k, v in Mailbox(memdev).regs().items()))
         return 0
+    if what == "query":
+        return query(memdev)
     if what == "race":
         return race(memdev, float(argv[3]))
     if what == "hammer":
