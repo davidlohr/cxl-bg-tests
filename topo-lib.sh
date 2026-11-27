@@ -1,0 +1,177 @@
+#!/bin/bash
+# topo-lib.sh - QEMU launch library for CXL mailbox background command testing
+#
+# Usage: source this file, then call launch_qemu with topology device args.
+#        Guest reachable via: guest_ssh <cmd>
+
+# One definition of "a splat", so enabling a new debug option does not
+# quietly go undetected. SPLAT_RE is every report the debug configs can
+# emit; UBSAN and "kernel BUG at" carry neither a BUG: nor a WARNING:
+# prefix, nor do hung-task, RCU stall and hard lockup reports, and the
+# kmemleak lines catch the detector switching itself off - which would
+# otherwise read as a clean scan.
+SPLAT_RE='BUG:|Oops|WARNING:|UBSAN:|kernel BUG at|Unable to handle|general protection|Kernel panic|INFO: trying to register non-static key|kmemleak: Kernel memory leak detector disabled|kmemleak: Cannot allocate|INFO: task .* blocked.* for more than|INFO: .*detected stall|detected hard LOCKUP'
+# The RAW command interface announces itself with a WARN the first time
+# it is used, and RAW is the only way to send a background command as
+# userspace on QEMU. splat_filter drops that one report, whole, so that
+# everything else on the console still counts.
+splat_filter() {
+	awk '
+		/-+\[ cut here \]-+/ { held = $0 "\n"; inblk = 1; raw = 0; next }
+		inblk {
+			held = held $0 "\n"
+			if (/raw command path used/) raw = 1
+			if (/-+\[ end trace/) {
+				if (!raw) printf "%s", held
+				inblk = 0; held = ""
+			}
+			next
+		}
+		{ print }
+		END { if (inblk) printf "%s", held }'
+}
+
+# Configuration (override by exporting before sourcing; see README).
+QEMU=${QEMU:-qemu-system-x86_64}
+KERNEL=${KERNEL:-$HOME/code/linux-torvalds/arch/x86/boot/bzImage}
+IMG=${IMG:-$HOME/img/cxl-test.qcow2}
+ROOTDEV=${ROOTDEV:-/dev/sda1}	# guest root partition (match your image)
+SSH_KEY=${SSH_KEY:-}		# ssh identity file; empty = default/agent
+EXTRA_APPEND=${EXTRA_APPEND:-}	# extra kernel cmdline appended to BOOTARGS
+SSHPORT=${SSHPORT:-27310}
+RUNDIR=${RUNDIR:-/tmp/cxl-bg-tests}
+QMPSOCK=$RUNDIR/qmp-sock
+CONSOLE_LOG=$RUNDIR/console.log
+PIDFILE=$RUNDIR/qemu.pid
+# Set by run-all per suite: every boot's serial console is kept there
+# for its splat scan (see console_archive).
+CONSOLE_ARCHIVE=${CONSOLE_ARCHIVE:-}
+
+# Serialize harness instances: concurrent runs share SSHPORT and the
+# pidfile, and stop_qemu kills by port pattern - two runs shred each
+# other's guests mid-scenario. The lock fd is inherited by suite
+# scripts run-all spawns; BG_TESTS_LOCKED keeps them from re-taking
+# the lock their parent already holds.
+mkdir -p "$RUNDIR"
+if [ -z "$BG_TESTS_LOCKED" ]; then
+	exec 9>"$RUNDIR/.lock"
+	if ! flock -n 9; then
+		echo "# waiting: another cxl-bg-tests run holds $RUNDIR/.lock" >&2
+		flock 9
+	fi
+	export BG_TESTS_LOCKED=1
+fi
+
+mkdir -p "$RUNDIR"
+
+# NB: no net.ifnames=0 - the guest image's netplan matches enp0s2, so the
+# e1000 must stay at 00:02.0 (first -device) with predictable naming.
+BOOTARGS="root=$ROOTDEV console=ttyS0 serial selinux=0 audit=0 \
+ignore_loglevel rw memhp_default_state=online log_buf_len=4M \
+cxl_acpi.dyndbg=+fplm cxl_pci.dyndbg=+fplm cxl_core.dyndbg=+fplm \
+cxl_mem.dyndbg=+fplm cxl_port.dyndbg=+fplm cxl_region.dyndbg=+fplm \
+$EXTRA_APPEND"
+
+# launch_qemu <device args...>
+# Boots in background; console to $CONSOLE_LOG, qmp on $QMPSOCK.
+launch_qemu() {
+	stop_qemu
+	console_archive
+	rm -f "$CONSOLE_LOG" "$RUNDIR/qemu.log"
+	"$QEMU" -smp 4 -m 4G -cpu host \
+		-drive file="$IMG" \
+		-kernel "$KERNEL" \
+		-append "$BOOTARGS" \
+		-d guest_errors -D "$RUNDIR/qemu.log" \
+		-machine q35,accel=kvm,cxl=on \
+		-device e1000,netdev=net0 \
+		-netdev user,id=net0,hostfwd=tcp:127.0.0.1:$SSHPORT-:22 \
+		"$@" \
+		-qmp unix:$QMPSOCK,server,wait=off \
+		-display none \
+		-enable-kvm \
+		-serial file:"$CONSOLE_LOG" \
+		-pidfile "$PIDFILE" \
+		-daemonize \
+		9>&-
+	# 9>&- : the daemonized guest must not inherit the suite lock
+	# (fd 9), or a leaked guest blocks every later run on flock.
+}
+
+stop_qemu() {
+	local pid i
+	if [ -f "$PIDFILE" ]; then
+		pid=$(cat "$PIDFILE")
+		kill "$pid" 2>/dev/null
+		for i in $(seq 1 20); do
+			kill -0 "$pid" 2>/dev/null || break
+			sleep 0.5
+		done
+		kill -9 "$pid" 2>/dev/null
+		rm -f "$PIDFILE"
+	fi
+	pkill -f "qemu-system-x86_64.*hostfwd=tcp:127.0.0.1:$SSHPORT" 2>/dev/null
+	for i in $(seq 1 10); do
+		ss -tln 2>/dev/null | grep -q ":$SSHPORT " || break
+		sleep 0.5
+	done
+	true
+}
+
+# console_archive: move the last boot's serial console into
+# $CONSOLE_ARCHIVE before the next launch overwrites it. The console
+# holds everything the guest kernel printed (ignore_loglevel), so it is
+# the only record of the boot window and of whatever a suite's dmesg -C
+# discarded. No-op outside run-all.
+console_archive() {
+	[ -n "$CONSOLE_ARCHIVE" ] && [ -s "$CONSOLE_LOG" ] || return 0
+	mkdir -p "$CONSOLE_ARCHIVE"
+	mv "$CONSOLE_LOG" "$CONSOLE_ARCHIVE/boot.$(ls "$CONSOLE_ARCHIVE" | wc -l).log"
+}
+
+guest_ssh() {
+	ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+	    -o ConnectTimeout=5 -o LogLevel=ERROR \
+	    ${SSH_KEY:+-i "$SSH_KEY"} -p "$SSHPORT" \
+	    root@localhost "$@"
+}
+
+guest_scp() {
+	scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+	    -o LogLevel=ERROR ${SSH_KEY:+-i "$SSH_KEY"} -P "$SSHPORT" "$@"
+}
+
+# wait_for_guest [timeout_sec]
+# Guards against talking to a stale guest from a previous topology:
+# the boot_id must differ from the one recorded by the last launch.
+wait_for_guest() {
+	local timeout=${1:-120} i=0 bid last=""
+	[ -f "$RUNDIR/boot_id" ] && last=$(cat "$RUNDIR/boot_id")
+	while [ $i -lt "$timeout" ]; do
+		bid=$(guest_ssh cat /proc/sys/kernel/random/boot_id 2>/dev/null)
+		if [ -n "$bid" ] && [ "$bid" != "$last" ]; then
+			echo "$bid" > "$RUNDIR/boot_id"
+			return 0
+		fi
+		sleep 2
+		i=$((i + 2))
+	done
+	echo "guest failed to come up (or stale boot); console tail:" >&2
+	tail -20 "$CONSOLE_LOG" >&2
+	return 1
+}
+
+# qmp_cmd '<json>'  (simple one-shot qmp; requires python3)
+qmp_cmd() {
+	python3 - "$QMPSOCK" "$1" <<'EOF'
+import json, socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.connect(sys.argv[1])
+f = s.makefile("rw")
+f.readline()                       # greeting
+f.write(json.dumps({"execute": "qmp_capabilities"}) + "\n"); f.flush()
+f.readline()
+f.write(sys.argv[2] + "\n"); f.flush()
+print(f.readline().strip())
+EOF
+}

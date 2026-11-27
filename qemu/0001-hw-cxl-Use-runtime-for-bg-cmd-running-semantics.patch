@@ -1,0 +1,37 @@
+From ee12beddc944993cd055472a89ca9ec1d2810e7a Mon Sep 17 00:00:00 2001
+From: Davidlohr Bueso <dave@stgolabs.net>
+Date: Tue, 17 Jun 2025 14:48:32 -0700
+Subject: [PATCH] hw/cxl: Use runtime for bg cmd running semantics
+
+The current check incorrectly misses the 0% case, which semantically
+can either be not running or one that just started. The runtime
+is a better way to check for 0%, 100% or aborted. This is currently
+benign in the kernel equivalent without cancel support.
+
+Signed-off-by: Davidlohr Bueso <dave@stgolabs.net>
+---
+ hw/cxl/cxl-device-utils.c | 5 +----
+ 1 file changed, 1 insertion(+), 4 deletions(-)
+
+diff --git a/hw/cxl/cxl-device-utils.c b/hw/cxl/cxl-device-utils.c
+index e150d7445762..add0ab615976 100644
+--- a/hw/cxl/cxl-device-utils.c
++++ b/hw/cxl/cxl-device-utils.c
+@@ -95,13 +95,10 @@ static uint64_t mailbox_reg_read(void *opaque, hwaddr offset, unsigned size)
+         }
+         if (offset == A_CXL_DEV_MAILBOX_STS) {
+             uint64_t status_reg = cxl_dstate->mbox_reg_state64[offset / size];
+-            int bgop;
+ 
+             qemu_mutex_lock(&cci->bg.lock);
+-            bgop = !(cci->bg.complete_pct == 100 || cci->bg.aborted);
+-
+             status_reg = FIELD_DP64(status_reg, CXL_DEV_MAILBOX_STS, BG_OP,
+-                                    bgop);
++                                    !!cci->bg.runtime);
+             cxl_dstate->mbox_reg_state64[offset / size] = status_reg;
+             qemu_mutex_unlock(&cci->bg.lock);
+         }
+-- 
+2.39.5
+

@@ -1,0 +1,107 @@
+From: cxl-bg-tests
+Subject: [PATCH] hw/cxl: testing aid, Activate FW in the background
+
+NOT FOR UPSTREAM. QEMU completes Activate FW at once, although the
+command may run in the background (CXL 4.0 8.2.10.3.3). Two properties
+of cxl-type3, for the actfw tests:
+
+  x-fw-activate-ms=N      Activate FW returns Background Command Started
+                          and completes N milliseconds later
+  x-fw-activate-fail=on   ... with "Activation Failed, FW Rolled Back"
+
+Without them nothing changes.
+---
+diff --git a/hw/cxl/cxl-mailbox-utils.c b/hw/cxl/cxl-mailbox-utils.c
+index 20e0b7e476e3..1c36ecfe2c81 100644
+--- a/hw/cxl/cxl-mailbox-utils.c
++++ b/hw/cxl/cxl-mailbox-utils.c
+@@ -1070,6 +1070,24 @@ static void __do_firmware_xfer(CXLCCI *cci)
+ }
+ 
+ /* CXL r3.1 section 8.2.9.3.3: Activate FW (Opcode 0202h) */
++/*
++ * Testing aid: with x-fw-activate-ms set, Activate FW runs in the
++ * background for that long, and with x-fw-activate-fail it then fails.
++ */
++static void __do_firmware_activate(CXLCCI *cci)
++{
++    if (CXL_TYPE3(cci->d)->fw_activate_fail) {
++        cci->bg.ret_code = CXL_MBOX_FW_ROLLEDBACK;
++        return;
++    }
++
++    if (cci->fw.bg_action == 0) {
++        cci->fw.active_slot = cci->fw.bg_slot;
++    } else {
++        cci->fw.staged_slot = cci->fw.bg_slot;
++    }
++}
++
+ static CXLRetCode cmd_firmware_update_activate(const struct cxl_cmd *cmd,
+                                                uint8_t *payload_in,
+                                                size_t len,
+@@ -1094,6 +1112,15 @@ static CXLRetCode cmd_firmware_update_activate(const struct cxl_cmd *cmd,
+         return CXL_MBOX_FW_INVALID_SLOT;
+     }
+ 
++    if (fw_activate->action <= 1 &&
++        object_dynamic_cast(OBJECT(cci->d), TYPE_CXL_TYPE3) &&
++        CXL_TYPE3(cci->d)->fw_activate_ms) {
++        cci->fw.bg_action = fw_activate->action;
++        cci->fw.bg_slot = fw_activate->slot;
++        cci->bg.runtime = CXL_TYPE3(cci->d)->fw_activate_ms;
++        return CXL_MBOX_BG_STARTED;
++    }
++
+     switch (fw_activate->action) {
+     case 0: /* online */
+         cci->fw.active_slot = fw_activate->slot;
+@@ -4666,6 +4693,9 @@ static void bg_timercb(void *opaque)
+         case 0x0201: /* fw transfer */
+             __do_firmware_xfer(cci);
+             break;
++        case 0x0202: /* fw activate */
++            __do_firmware_activate(cci);
++            break;
+         case 0x4400: /* sanitize */
+         {
+             CXLType3Dev *ct3d = CXL_TYPE3(cci->d);
+diff --git a/hw/mem/cxl_type3.c b/hw/mem/cxl_type3.c
+index cba05ec57d19..dbb7715a762f 100644
+--- a/hw/mem/cxl_type3.c
++++ b/hw/mem/cxl_type3.c
+@@ -1367,6 +1367,9 @@ static const Property ct3_props[] = {
+                                 width, PCIE_LINK_WIDTH_16),
+     DEFINE_PROP_BOOL("x-256b-flit", CXLType3Dev, flitmode, false),
+     DEFINE_PROP_BOOL("hdm-db", CXLType3Dev, hdmdb, false),
++    DEFINE_PROP_UINT32("x-fw-activate-ms", CXLType3Dev, fw_activate_ms, 0),
++    DEFINE_PROP_BOOL("x-fw-activate-fail", CXLType3Dev, fw_activate_fail,
++                     false),
+ };
+ 
+ static uint64_t get_lsa_size(CXLType3Dev *ct3d)
+diff --git a/include/hw/cxl/cxl_device.h b/include/hw/cxl/cxl_device.h
+index ba551fa5f979..42e618a9fb57 100644
+--- a/include/hw/cxl/cxl_device.h
++++ b/include/hw/cxl/cxl_device.h
+@@ -205,6 +205,9 @@ typedef struct CXLCCI {
+         size_t prev_offset;
+         size_t prev_len;
+         time_t last_partxfer;
++        /* Activate FW run in the background */
++        uint8_t bg_action;
++        uint8_t bg_slot;
+     } fw;
+ 
+     size_t payload_max;
+@@ -777,6 +780,10 @@ struct CXLType3Dev {
+     /* BI flows */
+     bool hdmdb;
+ 
++    /* testing aid: Activate FW in the background */
++    uint32_t fw_activate_ms;
++    bool fw_activate_fail;
++
+     struct dynamic_capacity {
+         HostMemoryBackend *host_dc;
+         AddressSpace host_dc_as;
