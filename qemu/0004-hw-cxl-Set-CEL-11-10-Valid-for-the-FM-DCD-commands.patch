@@ -1,4 +1,4 @@
-From 940f6bb4add79490940483720ebd3be7d976ce16 Mon Sep 17 00:00:00 2001
+From 488106f0835369c3e1a4a46f91830360d7fa2ff2 Mon Sep 17 00:00:00 2001
 From: Davidlohr Bueso <dave@stgolabs.net>
 Date: Fri, 27 Nov 2026 15:18:10 -0800
 Subject: [PATCH] hw/cxl: Set CEL[11:10] Valid for the FM DCD commands
@@ -9,6 +9,9 @@ Conventional and after a CXL Reset, bits 10 and 11 of their command
 effects. Per CXL r4.0 Table 8-254 (CEL Entry Structure) those two bits
 are only valid when bit 9, CEL[11:10] Valid, is set as well.
 
+Fixes: 1befc7bde30d ("hw/cxl: mailbox-utils: 0x5602 - FMAPI Set DC Region Config")
+Fixes: 42cbc937d4f6 ("hw/cxl: mailbox-utils: 0x5604 - FMAPI Initiate DC Add")
+Fixes: fdd48ce20ce1 ("hw/cxl: mailbox-utils: 0x5605 - FMAPI Initiate DC Release")
 Signed-off-by: Davidlohr Bueso <dave@stgolabs.net>
 ---
  hw/cxl/cxl-mailbox-utils.c | 3 +++

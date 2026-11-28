@@ -1,4 +1,4 @@
-From 800b18a17dc085bea3769182310f173c47b51072 Mon Sep 17 00:00:00 2001
+From 6898aaf84931508d86f2ccf23ab6b41bf8e7dc94 Mon Sep 17 00:00:00 2001
 From: Davidlohr Bueso <dave@stgolabs.net>
 Date: Fri, 27 Nov 2026 14:22:58 -0800
 Subject: [PATCH] hw/cxl: Add Populate Log and Get Log Capabilities
